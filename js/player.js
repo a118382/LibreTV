@@ -397,9 +397,18 @@ function showShortcutHint(text, direction) {
 }
 
 // 初始化播放器
-function initPlayer(videoUrl) {
+async function initPlayer(videoUrl) {
     if (!videoUrl) {
         return
+    }
+
+    // 关键修复：视频源必须走代理并携带认证参数
+    // 否则直连采集站会被 CORS 拦截，或经代理时因缺少 auth 被 401 拒绝
+    let playerUrl = videoUrl;
+    if (/^https?:\/\//i.test(playerUrl) && playerUrl.indexOf('/proxy/') === -1) {
+        playerUrl = window.ProxyAuth
+            ? await window.ProxyAuth.addAuthToProxyUrl(PROXY_URL + encodeURIComponent(playerUrl))
+            : PROXY_URL + encodeURIComponent(playerUrl);
     }
 
     // 销毁旧实例
@@ -411,7 +420,7 @@ function initPlayer(videoUrl) {
     // 配置HLS.js选项
     const hlsConfig = {
         debug: false,
-        loader: adFilteringEnabled ? CustomHlsJsLoader : Hls.DefaultConfig.loader,
+        loader: CustomHlsJsLoader,
         enableWorker: true,
         lowLatencyMode: false,
         backBufferLength: 90,
@@ -440,7 +449,7 @@ function initPlayer(videoUrl) {
     // Create new ArtPlayer instance
     art = new Artplayer({
         container: '#player',
-        url: videoUrl,
+        url: playerUrl,
         type: 'm3u8',
         title: videoTitle,
         volume: 0.8,
@@ -764,20 +773,31 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
         super(config);
         const load = this.load.bind(this);
         this.load = function (context, config, callbacks) {
-            // 拦截manifest和level请求
-            if (context.type === 'manifest' || context.type === 'level') {
-                const onSuccess = callbacks.onSuccess;
-                callbacks.onSuccess = function (response, stats, context) {
-                    // 如果是m3u8文件，处理内容以移除广告分段
-                    if (response.data && typeof response.data === 'string') {
-                        // 过滤掉广告段 - 实现更精确的广告过滤逻辑
-                        response.data = filterAdsFromM3U8(response.data, true);
-                    }
-                    return onSuccess(response, stats, context);
-                };
+            const needsAdFilter = adFilteringEnabled && (context.type === 'manifest' || context.type === 'level');
+
+            const startLoad = () => {
+                if (needsAdFilter) {
+                    const onSuccess = callbacks.onSuccess;
+                    callbacks.onSuccess = function (response, stats, ctx) {
+                        // 如果是m3u8文件，处理内容以移除广告分段
+                        if (response.data && typeof response.data === 'string') {
+                            response.data = filterAdsFromM3U8(response.data, true);
+                        }
+                        return onSuccess(response, stats, ctx);
+                    };
+                }
+                load(context, config, callbacks);
+            };
+
+            // 关键修复：服务器重写后的分片/KEY URL（/proxy/...）不带 auth，
+            // 必须在每次请求时动态补上认证参数，否则 10 分钟内也会被 401 拒绝
+            if (context && context.url && context.url.indexOf('/proxy/') !== -1 && window.ProxyAuth) {
+                window.ProxyAuth.addAuthToProxyUrl(context.url)
+                    .then(u => { context.url = u; startLoad(); })
+                    .catch(() => startLoad());
+                return;
             }
-            // 执行原始load方法
-            load(context, config, callbacks);
+            startLoad();
         };
     }
 }
